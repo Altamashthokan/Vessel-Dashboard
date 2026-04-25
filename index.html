@@ -613,8 +613,10 @@ function deriveVesselData(rows) {
         name,
         status: '',
         port: '—',
-        cargoOnBoard: 0,
-        bunkerOut: 0,
+        cargoOnBoard: 0,   // net cargo currently on board
+        bunkerSelfUsed: 0, // total bunker taken for self-consumption
+        bunkerGiven: 0,    // total bunker given to other vessels
+        bunkerReceived: 0, // bunker received from other vessels
         cargoProduct: '—',
         lastUpdate: '',
         eta: '',
@@ -638,20 +640,52 @@ function deriveVesselData(rows) {
     if (product && product !== '—' && !product.match(/^(nan|NaN)$/)) v.cargoProduct = product;
     if (date) v.lastUpdate = formatDate(date) + (time ? ' · ' + formatTime(time) : '');
 
-    // Track cargo (loading/discharging)
-    if (voucher.includes('cargo loading') && qtyIn > 0) v.cargoOnBoard += qtyIn;
-    if (voucher.includes('cargo discharged') && qtyOut > 0) v.cargoOnBoard -= qtyOut;
+    // ── CARGO LOADING ──────────────────────────────────────────
+    // Voucher = "Cargo Loading", Qty In > 0  →  add to on-board
+    if (voucher.includes('cargo loading') && qtyIn > 0) {
+      v.cargoOnBoard += qtyIn;
+    }
 
-    // Track bunker consumed (self-bunker)
-    if (voucher.includes('bunker') && !voucher.includes('cargo') && qtyOut > 0) v.bunkerOut += qtyOut;
+    // ── CARGO DISCHARGED ───────────────────────────────────────
+    // Voucher = "Cargo Discharged", Qty Out > 0  →  deduct from on-board
+    // Covers both: sale/delivery AND bunker supply to other ships
+    if (voucher.includes('cargo discharged') && qtyOut > 0) {
+      v.cargoOnBoard -= qtyOut;
+      // If particular mentions "bunker to" another vessel, track separately
+      if (/bunker.*(to|given|supply)/i.test(particular) || /given to/i.test(particular)) {
+        v.bunkerGiven += qtyOut;
+      }
+    }
+
+    // ── BUNKER VOUCHER ─────────────────────────────────────────
+    // Voucher = "Bunker" (not Cargo Loading/Discharged)
+    if (voucher === 'bunker') {
+
+      // Qty Out → vessel consumed its own on-board cargo as bunker (self-use)
+      // e.g. "Bunker Taken from deck side to Main Tank", "Self Bunker 1320 IG"
+      if (qtyOut > 0) {
+        v.cargoOnBoard  -= qtyOut;  // ← THIS IS THE FIX: deduct from cargo
+        v.bunkerSelfUsed += qtyOut;
+      }
+
+      // Qty In → vessel received bunker from another vessel
+      // e.g. "Bunker From Reyukaisen Karuo"
+      if (qtyIn > 0) {
+        v.cargoOnBoard   += qtyIn;  // adds to on-board (received product)
+        v.bunkerReceived += qtyIn;
+      }
+    }
 
     // ETA from particular
-    const etaMatch = particular.match(/eta[:\s]+([^\n,]+)/i);
+    const etaMatch = (r['Particular'] || '').match(/eta[:\s]+([^\n,]+)/i);
     if (etaMatch) v.eta = etaMatch[1].trim();
   });
 
-  // Clamp cargo to 0
-  Object.values(vessels).forEach(v => { if (v.cargoOnBoard < 0) v.cargoOnBoard = 0; });
+  // Clamp cargo to 0 (can't be negative)
+  Object.values(vessels).forEach(v => {
+    if (v.cargoOnBoard < 0) v.cargoOnBoard = 0;
+  });
+
   return Object.values(vessels);
 }
 
