@@ -462,13 +462,22 @@
 
 <script>
 // ===================== CONFIG =====================
-const CSV_URL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vRoLfXG-Gdo8bs9BSYecpaM1SkFkWIYWXnP0o9EixA-8FF4Jc8qzQypFnVWlNl0vTVGmnnnWU8IIqUr/pub?output=csv';
+// PRIMARY source — Google Apps Script Web App (instant, no cache, no CORS issues)
+// See SETUP_GUIDE.md for 2-minute setup. Paste your deployed URL below:
+const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbysDph_xO3Pb3Sp2FJN6XrkZjU2IRhXyTGqvSemqU4CoNa9trbClT31Plr8gPrwubhpiA/exec'; // <-- paste your script URL here after setup
 
-// Multiple CORS proxies — tried in order until one works
-const CORS_PROXIES = [
-  url => `https://corsproxy.io/?${encodeURIComponent(url)}`,
-  url => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
-  url => `https://thingproxy.freeboard.io/fetch/${url}`,
+// FALLBACK — published CSV (Google caches this up to 5 min)
+const CSV_BASE_URL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vRoLfXG-Gdo8bs9BSYecpaM1SkFkWIYWXnP0o9EixA-8FF4Jc8qzQypFnVWlNl0vTVGmnnnWU8IIqUr/pub?output=csv';
+
+// Cache-bust: unique timestamp per request so proxies never serve stale data
+const addCacheBust = url => url + '&_t=' + Date.now() + '&_r=' + Math.random().toString(36).slice(2);
+
+// CORS proxy fallback chain — tries each in order
+const PROXY_CHAIN = [
+  url => 'https://corsproxy.io/?' + encodeURIComponent(url),
+  url => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(url),
+  url => 'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(url),
+  url => 'https://corsproxy.org/?' + encodeURIComponent(url),
 ];
 
 const VESSEL_CAPACITIES = {
@@ -853,40 +862,70 @@ function renderSummary(vesselData, rows) {
   document.getElementById('totalAmount').textContent = 'AED ' + (totalAmount / 1000).toFixed(0) + 'K';
 }
 
-// ===================== FETCH & RENDER =====================
-async function fetchCSV() {
-  // Try each CORS proxy in order
-  for (let i = 0; i < CORS_PROXIES.length; i++) {
-    try {
-      const proxyUrl = CORS_PROXIES[i](CSV_URL);
-      const res = await fetch(proxyUrl, { cache: 'no-cache' });
-      if (!res.ok) continue;
-      const text = await res.text();
-      if (text && text.length > 50) return text; // sanity check
-    } catch (e) {
-      console.warn(`Proxy ${i} failed:`, e.message);
-    }
-  }
-  throw new Error('All fetch attempts failed. Check internet connection or re-publish Google Sheet.');
+// ===================== FETCH ENGINE =====================
+let dataSource = 'unknown';
+
+async function fetchFromAppsScript() {
+  // Apps Script returns JSON directly — no CSV parsing needed
+  const url = APPS_SCRIPT_URL + '?_t=' + Date.now();
+  const res = await fetch(url, { cache: 'no-cache' });
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  const json = await res.json();
+  if (json.error) throw new Error('Script error: ' + json.error);
+  if (!json.rows || !json.rows.length) throw new Error('No rows returned from script');
+  dataSource = 'Apps Script ⚡ real-time';
+  return json.rows; // already an array of objects with correct keys
 }
 
+async function fetchFromCSVProxy() {
+  const errors = [];
+  for (let i = 0; i < PROXY_CHAIN.length; i++) {
+    try {
+      const busted = addCacheBust(CSV_BASE_URL);
+      const proxyUrl = PROXY_CHAIN[i](busted);
+      const res = await fetch(proxyUrl, { cache: 'no-cache' });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const text = await res.text();
+      if (!text || text.length < 30) throw new Error('Empty response');
+      if (text.trim().startsWith('<')) throw new Error('Got HTML (proxy error page)');
+      const parsed = parseCSVSmart(text);
+      const rows = processRows(parsed);
+      if (!rows.length) throw new Error('CSV parsed but 0 data rows');
+      dataSource = 'CSV proxy ' + (i + 1);
+      return rows;
+    } catch(e) {
+      errors.push('Proxy ' + (i+1) + ': ' + e.message);
+      console.warn('Proxy ' + (i+1) + ' failed:', e.message);
+    }
+  }
+  throw new Error('All proxies failed:\n' + errors.join('\n'));
+}
+
+// ===================== FETCH & RENDER =====================
 async function fetchAndRender() {
   const btn = document.getElementById('refreshBtn');
   btn.classList.add('spinning');
 
-  // Show loading states
   document.getElementById('vesselLoadState').style.display = 'flex';
-  document.getElementById('vesselLoadState').innerHTML = '<div class="spinner"></div> Fetching from Google Sheets…';
+  document.getElementById('vesselLoadState').innerHTML = '<div class="spinner"></div> Fetching live data…';
   document.getElementById('logLoadState').style.display = 'flex';
   document.getElementById('logLoadState').innerHTML = '<div class="spinner"></div> Loading activity log…';
   document.getElementById('logScroll').style.display = 'none';
 
   try {
-    const csvText = await fetchCSV();
-    const parsed = parseCSVSmart(csvText);
-    allRows = processRows(parsed);
+    // Try Apps Script first (instant), fall back to CSV proxies
+    if (APPS_SCRIPT_URL && APPS_SCRIPT_URL.startsWith('https://')) {
+      try {
+        allRows = await fetchFromAppsScript();
+      } catch(e) {
+        console.warn('Apps Script failed, falling back to CSV proxy:', e.message);
+        allRows = await fetchFromCSVProxy();
+      }
+    } else {
+      allRows = await fetchFromCSVProxy();
+    }
 
-    if (!allRows.length) throw new Error('No data rows found in sheet. Ensure the sheet is published as CSV.');
+    if (!allRows.length) throw new Error('No data rows found. Please add entries to the Updates sheet.');
 
     const vesselData = deriveVesselData(allRows);
     renderVesselCards(vesselData);
@@ -894,19 +933,21 @@ async function fetchAndRender() {
     buildFilterButtons(allRows);
     renderSummary(vesselData, allRows);
 
-    // Show fetch time
     const now = new Date();
     const timeStr = now.toLocaleTimeString('en-AE', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-    document.getElementById('lastFetchTime').textContent = timeStr;
+    document.getElementById('lastFetchTime').textContent = timeStr + ' · via ' + dataSource;
     document.getElementById('lastFetchBar').style.display = 'flex';
-    document.getElementById('footerRefresh').textContent = 'Last sync: ' + timeStr;
+    document.getElementById('footerRefresh').textContent = 'Last sync: ' + timeStr + ' (' + allRows.length + ' entries)';
 
   } catch (err) {
     console.error('Fetch error:', err);
-    document.getElementById('vesselLoadState').innerHTML = `<span style="color:var(--accent4)">⚠ ${err.message}</span>`;
-    document.getElementById('vesselLoadState').style.display = 'flex';
-    document.getElementById('logLoadState').innerHTML = `<span style="color:var(--accent4)">⚠ ${err.message}</span>`;
-    document.getElementById('logLoadState').style.display = 'flex';
+    const msg = err.message.replace(/\n/g, '<br>');
+    document.getElementById('vesselLoadState').innerHTML =
+      `<div style="text-align:center"><div style="color:var(--accent4);font-size:13px;margin-bottom:8px">⚠ Could not load data</div>
+       <div style="font-family:'DM Mono',monospace;font-size:10px;color:var(--text3);max-width:500px;line-height:1.6">${msg}</div>
+       <button onclick="fetchAndRender()" style="margin-top:12px;padding:6px 16px;border-radius:20px;border:1px solid var(--accent);background:transparent;color:var(--accent);font-family:'DM Mono',monospace;font-size:11px;cursor:pointer">↻ Try Again</button></div>`;
+    document.getElementById('logLoadState').innerHTML = '';
+    document.getElementById('logLoadState').style.display = 'none';
   }
 
   btn.classList.remove('spinning');
@@ -923,8 +964,8 @@ function updateDate() {
 updateDate();
 setInterval(updateDate, 60000);
 fetchAndRender();
-// Auto-refresh every 5 minutes
-setInterval(fetchAndRender, 5 * 60 * 1000);
+// Auto-refresh every 2 minutes
+setInterval(fetchAndRender, 2 * 60 * 1000);
 </script>
 </body>
 </html>
