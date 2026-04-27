@@ -466,8 +466,10 @@
 // See SETUP_GUIDE.md for 2-minute setup. Paste your deployed URL below:
 const APPS_SCRIPT_URL = ''; // <-- paste your script URL here after setup
 
-// FALLBACK — published CSV (Google caches this up to 5 min)
-const CSV_BASE_URL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vRoLfXG-Gdo8bs9BSYecpaM1SkFkWIYWXnP0o9EixA-8FF4Jc8qzQypFnVWlNl0vTVGmnnnWU8IIqUr/pub?output=csv';
+// FALLBACK — published CSV pointing to the UPDATES sheet (gid must match your Updates tab)
+// To find your gid: open Google Sheet → click Updates tab → copy number after #gid= in URL
+const SHEET_GID = '0'; // <-- REPLACE with your Updates tab gid (check URL when on Updates tab)
+const CSV_BASE_URL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vRoLfXG-Gdo8bs9BSYecpaM1SkFkWIYWXnP0o9EixA-8FF4Jc8qzQypFnVWlNl0vTVGmnnnWU8IIqUr/pub?gid=' + SHEET_GID + '&single=true&output=csv';
 
 // Cache-bust: unique timestamp per request so proxies never serve stale data
 const addCacheBust = url => url + '&_t=' + Date.now() + '&_r=' + Math.random().toString(36).slice(2);
@@ -595,10 +597,19 @@ function parseCSVSmart(text) {
 }
 
 function processRows(rows) {
-  return rows.filter(r => {
+  const filtered = rows.filter(r => {
     const vessel = (r['Vessel'] || '').trim();
     return vessel && vessel !== 'Vessel' && vessel !== 'Sr.No' && !/^nan$/i.test(vessel);
   });
+  // Debug: log all unique voucher types found in the data
+  const vouchers = [...new Set(filtered.map(r => (r['Voucher Type'] || '').trim()))].filter(Boolean).sort();
+  console.log('[Fleet Dashboard] Voucher types found:', vouchers);
+  // Debug: log Al Tarf rows specifically
+  const alTarf = filtered.filter(r => (r['Vessel'] || '').toLowerCase().includes('al tarf') || (r['Vessel'] || '').toLowerCase().includes('tarf'));
+  if (alTarf.length) {
+    console.log('[Fleet Dashboard] Al Tarf rows (' + alTarf.length + '):', alTarf.map(r => ({v: r['Voucher Type'], qi: r['Qty In'], qo: r['Qty Out'], p: r['Particular']})));
+  }
+  return filtered;
 }
 
 // Derive vessel summary from activity log
@@ -613,9 +624,10 @@ function deriveVesselData(rows) {
         name,
         status: '',
         port: '—',
-        cargoOnBoard: 0,   // net cargo currently on board
-        bunkerSelfUsed: 0, // total bunker taken for self-consumption
-        bunkerGiven: 0,    // total bunker given to other vessels
+        cargoOnBoard: 0,   // net CARGO on board (loaded for delivery) — never mixed with bunker
+        bunkerOnBoard: 0,  // net BUNKER on board (vessel's own fuel, separate tank)
+        bunkerSelfUsed: 0, // cumulative bunker consumed by vessel
+        bunkerGiven: 0,    // bunker discharged as supply to other vessels (via Cargo Discharged)
         bunkerReceived: 0, // bunker received from other vessels
         cargoProduct: '—',
         lastUpdate: '',
@@ -642,39 +654,41 @@ function deriveVesselData(rows) {
     if (date)    v.lastUpdate = formatDate(date) + (time ? ' · ' + formatTime(time) : '');
 
     // ── CARGO LOADING ──────────────────────────────────────────
-    // Voucher = "Cargo Loading", Qty In > 0  →  add to on-board
-    if (voucher.includes('cargo loading') && qtyIn > 0) {
+    // Match any voucher that contains "cargo" AND ("load" or "in" or "receipt")
+    // Handles: "Cargo Loading", "Cargo Load", "Cargo In", "Cargo Receipt", etc.
+    const isCargoLoad = voucher.includes('cargo') &&
+      (voucher.includes('load') || voucher.includes(' in') || voucher.includes('receipt'));
+    if (isCargoLoad && qtyIn > 0) {
       v.cargoOnBoard += qtyIn;
     }
 
     // ── CARGO DISCHARGED ───────────────────────────────────────
-    // Voucher = "Cargo Discharged", Qty Out > 0  →  deduct from on-board
-    // Covers both: sale/delivery AND bunker supply to other ships
-    if (voucher.includes('cargo discharged') && qtyOut > 0) {
+    // Match any voucher that contains "cargo" AND ("discharg" or "out" or "deliver" or "offload")
+    // Handles: "Cargo Discharged", "Cargo Out", "Cargo Delivery", "Cargo Offload", etc.
+    const isCargoDischarge = voucher.includes('cargo') &&
+      (voucher.includes('discharg') || voucher.includes(' out') || voucher.includes('deliver') || voucher.includes('offload'));
+    if (isCargoDischarge && qtyOut > 0) {
       v.cargoOnBoard -= qtyOut;
-      // If particular mentions "bunker to" another vessel, track separately
       if (/bunker.*(to|given|supply)/i.test(particular) || /given to/i.test(particular)) {
         v.bunkerGiven += qtyOut;
       }
     }
 
     // ── BUNKER VOUCHER ─────────────────────────────────────────
-    // Voucher = "Bunker" (not Cargo Loading/Discharged)
-    if (voucher === 'bunker') {
-
-      // Qty Out → vessel consumed its own on-board cargo as bunker (self-use)
-      // e.g. "Bunker Taken from deck side to Main Tank", "Self Bunker 1320 IG"
+    // Voucher = "Bunker" = vessel's OWN FUEL (completely separate tank from cargo).
+    // Bunker NEVER affects cargoOnBoard — cargo and bunker are physically separate.
+    // Also handles: "Bunker Supply", "Bunker Received", "Bunker Transfer"
+    const isBunker = voucher.includes('bunker') && !isCargoLoad && !isCargoDischarge;
+    if (isBunker) {
       if (qtyOut > 0) {
-        v.cargoOnBoard  -= qtyOut;  // ← THIS IS THE FIX: deduct from cargo
+        v.bunkerOnBoard  -= qtyOut;
         v.bunkerSelfUsed += qtyOut;
       }
-
-      // Qty In → vessel received bunker from another vessel
-      // e.g. "Bunker From Reyukaisen Karuo"
       if (qtyIn > 0) {
-        v.cargoOnBoard   += qtyIn;  // adds to on-board (received product)
+        v.bunkerOnBoard  += qtyIn;
         v.bunkerReceived += qtyIn;
       }
+      // cargoOnBoard intentionally NOT touched here
     }
 
     // ETA from particular
@@ -742,20 +756,21 @@ function renderVesselCards(vesselData) {
     return;
   }
 
-  const maxBunker = Math.max(...vesselData.map(v => v.bunkerSelfUsed), 1);
+  const maxBunker = Math.max(...vesselData.map(v => Math.abs(v.bunkerOnBoard)), 1);
 
   vesselData.forEach(vessel => {
     const sc = getStatusConfig(vessel.status);
     const color = getVesselColor(vessel.name);
     const cargoBarWidth = vessel.cargoOnBoard > 0 ? Math.min(100, (vessel.cargoOnBoard / vessel.capacity) * 100) : 0;
     const cargoPercent  = vessel.cargoOnBoard > 0 ? Math.min(100, (vessel.cargoOnBoard / vessel.capacity) * 100).toFixed(1) : 0;
-    const bunkerBarWidth = vessel.bunkerSelfUsed > 0 ? Math.max(6, (vessel.bunkerSelfUsed / maxBunker) * 100) : 0;
+    const bunkerNet      = vessel.bunkerOnBoard;
+    const bunkerBarWidth = Math.abs(bunkerNet) > 0 ? Math.max(6, (Math.abs(bunkerNet) / maxBunker) * 100) : 0;
 
-    // Build bunker detail tooltip string
+    // Bunker breakdown detail line
     const bunkerParts = [];
-    if (vessel.bunkerSelfUsed > 0) bunkerParts.push(`Self: ${vessel.bunkerSelfUsed.toFixed(1)} MT`);
-    if (vessel.bunkerGiven    > 0) bunkerParts.push(`Given: ${vessel.bunkerGiven.toFixed(1)} MT`);
-    if (vessel.bunkerReceived > 0) bunkerParts.push(`Recv: ${vessel.bunkerReceived.toFixed(1)} MT`);
+    if (vessel.bunkerReceived > 0) bunkerParts.push(`Rcvd: ${vessel.bunkerReceived.toFixed(1)} MT`);
+    if (vessel.bunkerSelfUsed > 0) bunkerParts.push(`Used: ${vessel.bunkerSelfUsed.toFixed(1)} MT`);
+    if (vessel.bunkerGiven    > 0) bunkerParts.push(`Supplied: ${vessel.bunkerGiven.toFixed(1)} MT`);
     const bunkerDetail = bunkerParts.join(' · ') || 'No bunker activity';
 
     const card = document.createElement('div');
@@ -787,11 +802,11 @@ function renderVesselCards(vesselData) {
           <div class="metric-bar"><div class="metric-bar-fill cargo-bar" style="width:${cargoBarWidth}%"></div></div>
         </div>
         <div class="metric" title="${bunkerDetail}">
-          <div class="metric-label">Bunker Used (self)</div>
-          <div class="metric-value ${vessel.bunkerSelfUsed > 0 ? 'bunker-val' : 'zero'}">
-            ${vessel.bunkerSelfUsed > 0 ? vessel.bunkerSelfUsed.toFixed(1) : '—'}
+          <div class="metric-label">Bunker on Board</div>
+          <div class="metric-value ${bunkerNet > 0 ? 'bunker-val' : bunkerNet < 0 ? 'zero' : 'zero'}">
+            ${Math.abs(bunkerNet) > 0 ? Math.abs(bunkerNet).toFixed(1) : '—'}
           </div>
-          <div class="metric-unit" style="font-size:8px;line-height:1.4">${bunkerDetail}</div>
+          <div class="metric-unit" style="font-size:8px;line-height:1.4">${bunkerDetail || 'No bunker activity'}</div>
           <div class="metric-bar"><div class="metric-bar-fill bunker-bar" style="width:${bunkerBarWidth}%"></div></div>
         </div>
       </div>
