@@ -658,22 +658,15 @@ function deriveVesselData(rows) {
     }
 
     // ── BUNKER VOUCHER ─────────────────────────────────────────
-    // Voucher = "Bunker" (not Cargo Loading/Discharged)
+    // Bunker = vessel's own fuel (separate tank — never mixed with cargo)
     if (voucher === 'bunker') {
-
-      // Qty Out → vessel consumed its own on-board cargo as bunker (self-use)
-      // e.g. "Bunker Taken from deck side to Main Tank", "Self Bunker 1320 IG"
       if (qtyOut > 0) {
-        v.cargoOnBoard  -= qtyOut;  // ← THIS IS THE FIX: deduct from cargo
-        v.bunkerSelfUsed += qtyOut;
+        v.bunkerSelfUsed += qtyOut;  // consumed own fuel
       }
-
-      // Qty In → vessel received bunker from another vessel
-      // e.g. "Bunker From Reyukaisen Karuo"
       if (qtyIn > 0) {
-        v.cargoOnBoard   += qtyIn;  // adds to on-board (received product)
-        v.bunkerReceived += qtyIn;
+        v.bunkerReceived += qtyIn;   // received fuel from another vessel
       }
+      // cargoOnBoard is NOT touched — bunker ≠ cargo
     }
 
     // ETA from particular
@@ -741,14 +734,21 @@ function renderVesselCards(vesselData) {
     return;
   }
 
-  const maxBunker = Math.max(...vesselData.map(v => v.bunkerOut), 1);
+  const maxBunker = Math.max(...vesselData.map(v => v.bunkerSelfUsed), 1);
 
   vesselData.forEach(vessel => {
     const sc = getStatusConfig(vessel.status);
     const color = getVesselColor(vessel.name);
-    const cargoBarWidth = vessel.cargoOnBoard > 0 ? Math.min(100, (vessel.cargoOnBoard / vessel.capacity) * 100) : 0;
-    const cargoPercent = vessel.cargoOnBoard > 0 ? Math.min(100, (vessel.cargoOnBoard / vessel.capacity) * 100).toFixed(1) : 0;
-    const bunkerBarWidth = vessel.bunkerOut > 0 ? Math.max(6, (vessel.bunkerOut / maxBunker) * 100) : 0;
+    const cargoBarWidth  = vessel.cargoOnBoard > 0 ? Math.min(100, (vessel.cargoOnBoard / vessel.capacity) * 100) : 0;
+    const cargoPercent   = vessel.cargoOnBoard > 0 ? Math.min(100, (vessel.cargoOnBoard / vessel.capacity) * 100).toFixed(1) : 0;
+    const bunkerBarWidth = vessel.bunkerSelfUsed > 0 ? Math.max(6, (vessel.bunkerSelfUsed / maxBunker) * 100) : 0;
+
+    // Bunker breakdown line shown under the metric
+    const bunkerParts = [];
+    if (vessel.bunkerSelfUsed > 0) bunkerParts.push('Used: ' + vessel.bunkerSelfUsed.toFixed(1) + ' MT');
+    if (vessel.bunkerGiven    > 0) bunkerParts.push('Supplied: ' + vessel.bunkerGiven.toFixed(1) + ' MT');
+    if (vessel.bunkerReceived > 0) bunkerParts.push('Rcvd: ' + vessel.bunkerReceived.toFixed(1) + ' MT');
+    const bunkerDetail = bunkerParts.join(' · ') || 'No bunker activity';
 
     const card = document.createElement('div');
     card.className = 'vessel-card';
@@ -775,19 +775,19 @@ function renderVesselCards(vesselData) {
           <div class="metric-value ${vessel.cargoOnBoard > 0 ? 'cargo-val' : 'zero'}">
             ${vessel.cargoOnBoard > 0 ? vessel.cargoOnBoard.toFixed(1) : '—'}
           </div>
-          <div class="metric-unit">${vessel.cargoOnBoard > 0 ? `${cargoPercent}% of ${vessel.capacity.toLocaleString()} MT` : 'No cargo'}</div>
+          <div class="metric-unit">${vessel.cargoOnBoard > 0 ? cargoPercent + '% of ' + vessel.capacity.toLocaleString() + ' MT' : 'No cargo'}</div>
           <div class="metric-bar"><div class="metric-bar-fill cargo-bar" style="width:${cargoBarWidth}%"></div></div>
         </div>
-        <div class="metric">
+        <div class="metric" title="${bunkerDetail}">
           <div class="metric-label">Bunker (Self-Use)</div>
-          <div class="metric-value ${vessel.bunkerOut > 0 ? 'bunker-val' : 'zero'}">
-            ${vessel.bunkerOut > 0 ? vessel.bunkerOut.toFixed(1) : '—'}
+          <div class="metric-value ${vessel.bunkerSelfUsed > 0 ? 'bunker-val' : 'zero'}">
+            ${vessel.bunkerSelfUsed > 0 ? vessel.bunkerSelfUsed.toFixed(1) : '—'}
           </div>
-          <div class="metric-unit">${vessel.bunkerOut > 0 ? 'MT consumed' : 'No consumption'}</div>
+          <div class="metric-unit" style="font-size:8px;line-height:1.5">${bunkerDetail}</div>
           <div class="metric-bar"><div class="metric-bar-fill bunker-bar" style="width:${bunkerBarWidth}%"></div></div>
         </div>
       </div>
-      ${vessel.eta ? `<div class="card-eta"><span class="eta-badge">🧭 ETA: ${vessel.eta}</span></div>` : ''}
+      ${vessel.eta ? '<div class="card-eta"><span class="eta-badge">🧭 ETA: ' + vessel.eta + '</span></div>' : ''}
       <div class="card-footer">
         <span class="port-icon">📍</span>
         <span class="port-name">${vessel.port && vessel.port !== '—' ? vessel.port : 'Position not reported'}</span>
